@@ -30,7 +30,7 @@
 
 # Target file name (without extension).
 # This is the base name of the compiled .hex file.
-TARGET = simpleserial
+TARGET = hal
 
 # List C source files here.
 # Header files (.h) are automatically pulled in.
@@ -40,15 +40,7 @@ SRC +=
 EXTRA_OPTS = NO_EXTRA_OPTS
 CFLAGS += -D$(EXTRA_OPTS)
 
-ifeq ($(CRYPTO_TARGET),)
-  ${info No CRYPTO_TARGET passed - defaulting to TINYAES128C}
-  CRYPTO_TARGET = TINYAES128C
-endif
+${info Building for platform ${PLATFORM}}
 
-${info Building for platform ${PLATFORM} with CRYPTO_TARGET=$(CRYPTO_TARGET)}
-
-#Add simpleserial project to build
-include ../simpleserial/Makefile.simpleserial
-
-FIRMWAREPATH = ../.
+FIRMWAREPATH = ./firmware
 include $(FIRMWAREPATH)/Makefile.inc
