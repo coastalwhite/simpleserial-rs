@@ -4,163 +4,271 @@
 #![warn(missing_docs)]
 #![deny(macro_use_extern_crate)]
 
-#[link(name = "simpleserial", kind = "static")]
-extern "C" {
-    fn simpleserial_init();
-    fn simpleserial_addcmd(
-        c: u8,
-        len: usize,
-        fp: Option<extern "C" fn(arg1: *mut u8) -> u8>,
-    ) -> i32;
-    fn simpleserial_get();
-    fn simpleserial_put(c: u8, size: u8, output: *mut u8);
-    fn platform_init();
-    fn init_uart();
-    fn trigger_setup();
+use array_utils::{array_resize, drift_to_end, superimpose};
+
+pub(crate) mod util;
+
+pub(crate) mod firmware;
+use firmware::*;
+
+mod capture_to_target;
+mod target_to_capture;
+
+use capture_to_target::CTPacket;
+use target_to_capture::TCPacket;
+
+use util::{pkt_insert_crc8, pkt_stuff, read_away, write_away};
+
+/// The generator polynomial used for the Cyclic Redundancy Checks
+pub(crate) const CRC_GEN_POLY: u8 = 0xA6;
+
+/// Errors
+#[cfg_attr(test, derive(Debug, PartialEq, Clone))]
+pub enum PktError {
+    /// There were insufficient bytes in the BUS
+    InsufficientBytes {
+        /// Length of BUS buffer
+        buffer_length: usize,
+    },
+    /// The DLEN didn't match the actual data
+    IncorrectDataLength {
+        /// Length of BUS buffer
+        buffer_length: usize,
+        /// DLEN
+        data_length: usize,
+    },
+    /// There was an invalid CRC
+    CrcInvalid,
 }
 
-mod hex_ascii;
+pub enum CmdError {
+    OK,
+    InvalidCommand,
+    BadCRC,
+    Timeout,
+    InvalidLength,
+    UnexpectedFrameByte,
+    Custom(u8),
+}
 
-/// All SimpleSerial Commands as structs
-pub mod cmds {
-    /// The base command trait
-    pub trait Command {
-        /// The prefix character for a command
-        const CMD_PREFIX: u8;
+impl CmdError {
+    fn get_byte(&self) -> u8 {
+        use CmdError::*;
+
+        match self {
+            OK => 0,
+            InvalidCommand => 1,
+            BadCRC => 2,
+            Timeout => 3,
+            InvalidLength => 4,
+            UnexpectedFrameByte => 5,
+            Custom(b) => *b,
+        }
+    }
+}
+
+type CmdResponse = (u8, u8, [u8; 192]);
+type CmdFn = &'static dyn Fn(u8, u8, &[u8]) -> Result<Option<CmdResponse>, CmdError>;
+type CmdSpecification = (u8, CmdFn);
+
+/// Container for SimpleSerial commands
+pub struct SimpleSerial<const MAX_CMDS: usize> {
+    cmds: [Option<CmdSpecification>; MAX_CMDS],
+    current_size: u8,
+}
+
+impl<const MAX_CMDS: usize> SimpleSerial<MAX_CMDS> {
+    /// Create a new SimpleSerial Instance
+    pub fn new() -> Self {
+        unsafe {
+            platform_init();
+            init_uart();
+            trigger_setup();
+        }
+
+        Self::new_no_init()
     }
 
-    /// Trait for incoming commands
-    pub trait InCommand: Command {
-        /// Register handler to fire on arriving of command
-        fn on_arrive<const ARG_SIZE: usize>(cb_handler: extern "C" fn(*mut u8) -> u8) {
+    /// Trigger a high on the trace trigger
+    pub fn trace_trigger_high() {
+        unsafe {
+            firmware::trigger_high();
+        }
+    }
+
+    /// Trigger a low on the trace trigger
+    pub fn trace_trigger_low() {
+        unsafe {
+            firmware::trigger_low();
+        }
+    }
+
+    /// Create a new SimpleSerial Instance without initializing the platform, uart and trigger.
+    pub fn new_no_init() -> Self {
+        SimpleSerial {
+            cmds: [None; MAX_CMDS],
+            current_size: 0,
+        }
+    }
+
+    /// Add an extra command handler
+    pub fn push(&mut self, cmd: u8, handler: CmdFn) -> Result<(), ()> {
+        let cur_size = usize::from(self.current_size);
+
+        // Check that we are not exceeding the command limit
+        if MAX_CMDS - cur_size <= 1 {
             unsafe {
-                super::simpleserial_addcmd(Self::CMD_PREFIX, ARG_SIZE, Some(cb_handler));
+                putch(b'a');
             }
+            return Err(());
         }
+
+        self.cmds[cur_size] = Some((cmd, handler));
+        self.current_size += 1;
+
+        Ok(())
     }
 
-    /// Trait for outgoing commands
-    pub trait OutCommand<const ARG_SIZE: usize>: Command {
-        /// Fetch the Hex ASCII string for a certain command
-        fn get_cmd_arg(&self) -> [u8; ARG_SIZE];
-
-        /// Send the outgoing command to the host machine
-        fn send(&self) {
-            use core::convert::TryInto;
-
-            unsafe {
-                super::simpleserial_put(
-                    Self::CMD_PREFIX,
-                    ARG_SIZE.try_into().unwrap(),
-                    self.get_cmd_arg().as_mut_ptr(),
-                );
-            }
-        }
+    /// Attempt to handle a command put on the BUS
+    pub fn attempt_handle(&self) -> Result<(), PktError> {
+        let pkt = CTPacket::fetch()?;
+        self.handle(pkt)
     }
 
-    // In's
-    /// Select stack / hardware to use (if supported).
-    pub struct SelectStackOrHardware;
-    /// Set encryption key; possibly trigger key scheduling
-    pub struct SetEncryptionKey;
-    /// Select cipher mode (if supported)
-    pub struct SetCipherMode;
-    /// Send input plain-text, cause encryption
-    pub struct SendPlainText;
-    /// Authentication challenge (i.e., expected AES result if using AES as auth-method)
-    pub struct AuthChallenge;
-    /// Check protocol version (no reply on v1.0; ACK on v1.1)
-    pub struct CheckProtocolVersion;
-    /// Clears Buffers (resets to 'IDLE' state), does not clear any variables.
-    pub struct ClearBuffers;
-
-    // Out's
-    /// Result of function - if encryption is encrypted result, if auth is '0..0' or '100..0'.
-    pub struct ResultOfFn<const R: usize>(pub [u8; R]);
-    /// ACK - Command processing done (with optional status code)
-    pub struct Ack(pub u8);
-
-    impl Command for SelectStackOrHardware {
-        const CMD_PREFIX: u8 = b'h';
-    }
-    impl Command for SetEncryptionKey {
-        const CMD_PREFIX: u8 = b'k';
-    }
-    impl Command for SetCipherMode {
-        const CMD_PREFIX: u8 = b'm';
-    }
-    impl Command for SendPlainText {
-        const CMD_PREFIX: u8 = b'p';
-    }
-    impl Command for AuthChallenge {
-        const CMD_PREFIX: u8 = b't';
-    }
-    impl Command for CheckProtocolVersion {
-        const CMD_PREFIX: u8 = b'v';
-    }
-    impl Command for ClearBuffers {
-        const CMD_PREFIX: u8 = b'x';
-    }
-
-    impl<const R: usize> Command for ResultOfFn<R> {
-        const CMD_PREFIX: u8 = b'r';
-    }
-    impl Command for Ack {
-        const CMD_PREFIX: u8 = b'z';
-    }
-
-    impl InCommand for SelectStackOrHardware {}
-    impl InCommand for SetEncryptionKey {}
-    impl InCommand for SetCipherMode {}
-    impl InCommand for SendPlainText {}
-    impl InCommand for AuthChallenge {}
-    impl InCommand for CheckProtocolVersion {}
-    impl InCommand for ClearBuffers {}
-
-    impl<const R: usize, const ARG_SIZE: usize> OutCommand<ARG_SIZE> for ResultOfFn<R> {
-        fn get_cmd_arg(&self) -> [u8; ARG_SIZE] {
-            let mut arg = [0; ARG_SIZE];
-
-            let ResultOfFn(bytes) = self;
-
-            for (index, byte) in bytes.iter().enumerate() {
-                let hex_ascii = super::hex_ascii::byte_to_hex_ascii(byte);
-
-                arg[index * 2] = hex_ascii[0];
-                arg[index * 2 + 1] = hex_ascii[1];
+    /// Handle all the commands that belong with a packet
+    fn handle(&self, packet: CTPacket) -> Result<(), PktError> {
+        match packet.cmd {
+            // Check version command
+            b'v' => {
+                TCPacket {
+                    cmd: b'r',
+                    dlen: 1,
+                    data: array_resize([2], 0),
+                }
+                .send()?;
             }
 
-            arg
-        }
-    }
+            // List commands command
+            b'w' => {
+                let mut cmd_chars: [u8; 192] = [0; 192];
+                for i in 0..usize::from(self.current_size) {
+                    cmd_chars[i] = packet.data[i];
+                }
 
-    impl OutCommand<2> for Ack {
-        fn get_cmd_arg(&self) -> [u8; 2] {
-            let Ack(byte) = self;
-            super::hex_ascii::byte_to_hex_ascii(byte)
+                TCPacket {
+                    cmd: b'r',
+                    dlen: self.current_size,
+                    data: cmd_chars,
+                }
+                .send()?;
+            }
+
+            // Rest of commands
+            _ => {
+                for i in 0..usize::from(self.current_size) {
+                    let (spec_cmd, spec_handler) = self.cmds[i].unwrap();
+
+                    // If the gotten command is the same as the command in listeners,
+                    // go and handle that listener.
+                    if packet.cmd == spec_cmd {
+                        match spec_handler(packet.sub_cmd, packet.dlen, &packet.data) {
+                            Err(err) => {
+                                TCPacket {
+                                    cmd: b'e',
+                                    dlen: 1,
+                                    data: array_resize([err.get_byte()], 0),
+                                }
+                                .send()?;
+
+                                return Ok(())
+                            }
+                            Ok(Some((cmd, dlen, data))) => {
+                                TCPacket { cmd, dlen, data }.send()?;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
         }
+
+        TCPacket {
+            cmd: b'e',
+            dlen: 1,
+            data: array_resize([CmdError::OK.get_byte()], 0),
+        }.send()?;
+
+        Ok(())
     }
 }
 
-/// Set up the SimpleSerial module
-/// This prepares any internal commands
-pub fn init() {
-    unsafe {
-        platform_init();
-        init_uart();
-        trigger_setup();
-        simpleserial_init();
+type UnstuffedBuffer = [u8; 254];
+
+trait SSPacket {
+    const METADATA_BYTES_LENGTH: usize;
+}
+
+trait SentPacket: SSPacket {
+    fn get_data_length(&self) -> usize;
+    fn get_data_bytes(&self) -> [u8; 192];
+    fn set_metadata_bytes(&self, buffer: &mut UnstuffedBuffer);
+    fn send(&self) -> Result<(), PktError> {
+        let data_size = self.get_data_length();
+
+        // Create a buffer with all the data in the packet
+        let mut buffer = superimpose([0; 254], self.get_data_bytes(), Self::METADATA_BYTES_LENGTH);
+        self.set_metadata_bytes(&mut buffer);
+        let length = data_size + Self::METADATA_BYTES_LENGTH;
+
+        let buffer = pkt_insert_crc8(buffer, length);
+        let buffer = pkt_stuff(buffer, length);
+
+        // Write the stuffed buffer away to the BUS
+        write_away(buffer);
+        Ok(())
     }
 }
 
-/// Attempt to process a command
-/// If a full string is found, the relevant callback function is called
-/// Might return without calling a callback for several reasons:
-/// - First character didn't match any known commands
-/// - One of the characters wasn't in [0-9|A-F|a-f]
-/// - Data was too short or too long
-pub fn get() {
-    unsafe {
-        simpleserial_get();
+trait ReceivedPacket: Sized + SSPacket {
+    // PTR, CRC, NULL
+    const STUFFED_LOWER_BOUND: usize = Self::METADATA_BYTES_LENGTH + 3;
+
+    // CRC
+    const UNSTUFFED_LENGTH_MIN_DATA: usize = Self::METADATA_BYTES_LENGTH + 1;
+
+    fn get_data_length_from_unstuffed(unstuffed_buffer: UnstuffedBuffer) -> usize;
+    fn new_from_unstuffed(unstuffed_buffer: UnstuffedBuffer) -> Self;
+    fn fetch() -> Result<Self, PktError> {
+        // Read BUS into buffer
+        let (buffer, length) = read_away::<256>();
+        // Verify a lower bound of the read buffer
+        if length < Self::STUFFED_LOWER_BOUND {
+            return Err(PktError::InsufficientBytes {
+                buffer_length: length,
+            });
+        }
+
+        // Unstuff the buffer
+        let (unstuffed, unstuffed_length) = cobs_rs::unstuff(buffer, 0x00);
+        // Verify the CRC correctness
+        if !crc8_rs::has_valid_crc8(
+            drift_to_end(unstuffed, unstuffed_length, 0, 0),
+            CRC_GEN_POLY,
+        ) {
+            return Err(PktError::CrcInvalid);
+        }
+
+        // Fetch the data length
+        let data_length = Self::get_data_length_from_unstuffed(unstuffed);
+        // Now verify the exact length of the buffer
+        if unstuffed_length - data_length != Self::UNSTUFFED_LENGTH_MIN_DATA {
+            return Err(PktError::IncorrectDataLength {
+                buffer_length: unstuffed_length,
+                data_length,
+            });
+        }
+
+        // Form a packet
+        Ok(Self::new_from_unstuffed(unstuffed))
     }
 }
