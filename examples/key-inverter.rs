@@ -1,24 +1,30 @@
-#![no_std]
 #![no_main]
+#![no_std]
 
 use panic_halt as _;
-use cortex_m_rt::entry;
 
-use simpleserial_rs::cmds::{ InCommand, OutCommand };
+use simpleserial_rs::{CmdError, SimpleSerial};
 
-extern fn invert_16_bit_key(_: *mut u8) -> u8 {
-    let result_cmd = simpleserial_rs::cmds::ResultOfFn([0x42; 16]);
-    OutCommand::<32>::send(&result_cmd);
-    0
+fn invert_16_bit_key(scmd: u8, dlen: u8, data: &[u8]) -> Result<Option<(u8, u8, [u8; 192])>, CmdError> {
+    if dlen == 16 {
+        Ok(Some((b'r', 16, {
+            let mut buff = [0; 192];
+            for i in 0..16 {
+                buff[i] = data[15 - i];
+            }
+            buff
+        })))
+    } else {
+        Err(CmdError::InvalidLength)
+    }
 }
 
-#[entry]
+#[no_mangle]
 fn main() -> ! {
-    simpleserial_rs::init();
-
-    simpleserial_rs::cmds::SetEncryptionKey::on_arrive::<32>(invert_16_bit_key);
+    let mut cmds: SimpleSerial<8> = SimpleSerial::new();
+    cmds.push(b'p', &invert_16_bit_key);
 
     loop {
-        simpleserial_rs::get();
+        cmds.attempt_handle();
     }
 }
